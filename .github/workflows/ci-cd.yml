@@ -1,0 +1,391 @@
+# GitHub Actions CI/CD Pipeline for React Application
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - prod
+
+env:
+  NODE_VERSION: '18'
+  DOCKER_REGISTRY: 'your-docker-registry.com'
+  DOCKER_REPO: 'react-devops-pipeline'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  # Code Quality and Security Checks
+  quality-checks:
+    name: Code Quality & Security
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: |
+        cd react-app
+        npm ci
+        
+    - name: Run ESLint
+      run: |
+        cd react-app
+        npm run lint
+        
+    - name: Run Prettier check
+      run: |
+        cd react-app
+        npm run format:check
+        
+    - name: Security audit
+      run: |
+        cd react-app
+        npm run security:audit
+        
+    - name: Run Snyk security scan
+      uses: snyk/actions/node@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=high
+        
+  # Unit and Integration Tests
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: quality-checks
+    
+    strategy:
+      matrix:
+        node-version: [18, 20]
+        
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: |
+        cd react-app
+        npm ci
+        
+    - name: Run unit tests
+      run: |
+        cd react-app
+        npm run test:ci
+        
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results-${{ matrix.node-version }}
+        path: react-app/test-results/
+        
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v4
+      with:
+        file: react-app/coverage/lcov.info
+        flags: unittests
+        name: codecov-umbrella
+        
+  # Build Application
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: [quality-checks, test]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: |
+        cd react-app
+        npm ci
+        
+    - name: Build application
+      run: |
+        cd react-app
+        npm run build
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-files
+        path: react-app/build/
+        retention-days: 30
+        
+  # Docker Build and Push
+  docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-files
+        path: react-app/build/
+        
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Login to Docker Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./docker/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+  # Infrastructure Validation
+  terraform-validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    if: contains(github.event.head_commit.modified, 'terraform/') || github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Terraform Init
+      run: |
+        cd terraform
+        terraform init
+        
+    - name: Terraform Validate
+      run: |
+        cd terraform
+        terraform validate
+        
+    - name: Terraform Plan
+      run: |
+        cd terraform
+        terraform plan -var-file="environments/dev.tfvars" -out=tfplan
+        
+    - name: Upload Terraform plan
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-plan
+        path: terraform/tfplan
+        
+  # Deploy to Development
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: [docker, terraform-validate]
+    if: github.ref == 'refs/heads/develop'
+    environment: development
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Download Terraform plan
+      uses: actions/download-artifact@v4
+      with:
+        name: terraform-plan
+        path: terraform/
+        
+    - name: Deploy infrastructure
+      run: |
+        cd terraform
+        terraform init
+        terraform apply -auto-approve tfplan
+        
+    - name: Deploy application
+      run: |
+        # Get EC2 instance IPs from Terraform output
+        INSTANCE_IPS=$(cd terraform && terraform output -json app_instances_ips | jq -r '.[]')
+        
+        # Deploy to each instance
+        for ip in $INSTANCE_IPS; do
+          echo "Deploying to $ip"
+          ssh -o StrictHostKeyChecking=no ec2-user@$ip '
+            docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}:develop
+            docker stop react-app || true
+            docker rm react-app || true
+            docker run -d --name react-app -p 80:80 --restart unless-stopped ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}:develop
+          '
+        done
+        
+  # Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [docker, terraform-validate]
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Deploy to staging
+      run: |
+        cd terraform
+        terraform init
+        terraform workspace select staging || terraform workspace new staging
+        terraform plan -var-file="environments/staging.tfvars" -out=tfplan
+        terraform apply -auto-approve tfplan
+        
+    - name: Run smoke tests
+      run: |
+        STAGING_URL=$(cd terraform && terraform output -raw load_balancer_dns)
+        curl -f http://$STAGING_URL/health
+        curl -f http://$STAGING_URL/
+        
+  # Deploy to Production
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Deploy to production
+      run: |
+        cd terraform
+        terraform init
+        terraform workspace select prod || terraform workspace new prod
+        terraform plan -var-file="environments/prod.tfvars" -out=tfplan
+        terraform apply -auto-approve tfplan
+        
+    - name: Run post-deployment tests
+      run: |
+        PROD_URL=$(cd terraform && terraform output -raw load_balancer_dns)
+        curl -f http://$PROD_URL/health
+        curl -f http://$PROD_URL/
+        
+    - name: Notify deployment success
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        channel: '#deployments'
+        text: '🚀 Production deployment successful!'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        
+  # Cleanup
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-latest
+    needs: [deploy-dev, deploy-staging, deploy-prod]
+    if: always()
+    
+    steps:
+    - name: Delete artifacts
+      uses: geekyeggo/delete-artifact@v4
+      with:
+        name: |
+          build-files
+          test-results-*
+          terraform-plan
+

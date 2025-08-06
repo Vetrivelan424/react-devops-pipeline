@@ -1,0 +1,437 @@
+// Jenkins Pipeline for React Application CI/CD
+pipeline {
+    agent any
+    
+    environment {
+        // Docker registry configuration
+        DOCKER_REGISTRY = 'your-docker-registry.com'
+        DOCKER_REPO = 'react-app'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        
+        // AWS configuration
+        AWS_REGION = 'us-east-1'
+        AWS_ACCOUNT_ID = credentials('aws-account-id')
+        
+        // Application configuration
+        APP_NAME = 'react-app'
+        ENVIRONMENT = "${env.BRANCH_NAME == 'main' ? 'prod' : 'dev'}"
+        
+        // Terraform configuration
+        TF_VAR_environment = "${ENVIRONMENT}"
+        TF_VAR_docker_image = "${DOCKER_REGISTRY}/${DOCKER_REPO}:${IMAGE_TAG}"
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "Checking out code from ${env.BRANCH_NAME} branch"
+                }
+                checkout scm
+                
+                // Clean workspace
+                sh 'git clean -fdx'
+            }
+        }
+        
+        stage('Environment Setup') {
+            steps {
+                script {
+                    echo "Setting up environment for ${ENVIRONMENT}"
+                    
+                    // Install Node.js dependencies
+                    sh '''
+                        node --version
+                        npm --version
+                        npm ci
+                    '''
+                }
+            }
+        }
+        
+        stage('Code Quality & Security') {
+            parallel {
+                stage('Lint') {
+                    steps {
+                        sh 'npm run lint'
+                    }
+                    post {
+                        always {
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'lint-results',
+                                reportFiles: 'index.html',
+                                reportName: 'ESLint Report'
+                            ])
+                        }
+                    }
+                }
+                
+                stage('Security Scan') {
+                    steps {
+                        sh '''
+                            # Run npm audit
+                            npm audit --audit-level moderate
+                            
+                            # Run Snyk security scan (if available)
+                            if command -v snyk &> /dev/null; then
+                                snyk test --severity-threshold=high
+                            fi
+                        '''
+                    }
+                }
+                
+                stage('Dependency Check') {
+                    steps {
+                        sh '''
+                            # Check for outdated packages
+                            npm outdated || true
+                            
+                            # Generate dependency report
+                            npm ls --depth=0 > dependency-report.txt || true
+                        '''
+                        
+                        archiveArtifacts artifacts: 'dependency-report.txt', fingerprint: true
+                    }
+                }
+            }
+        }
+        
+        stage('Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh 'npm run test:ci'
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'test-results/junit.xml'
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'coverage',
+                                reportFiles: 'index.html',
+                                reportName: 'Coverage Report'
+                            ])
+                        }
+                    }
+                }
+                
+                stage('E2E Tests') {
+                    when {
+                        anyOf {
+                            branch 'main'
+                            branch 'develop'
+                        }
+                    }
+                    steps {
+                        sh '''
+                            # Start application for E2E testing
+                            npm run build
+                            npm run start:test &
+                            APP_PID=$!
+                            
+                            # Wait for application to start
+                            sleep 30
+                            
+                            # Run E2E tests
+                            npm run test:e2e || TEST_RESULT=$?
+                            
+                            # Stop application
+                            kill $APP_PID || true
+                            
+                            exit ${TEST_RESULT:-0}
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                script {
+                    echo "Building React application for ${ENVIRONMENT}"
+                }
+                
+                sh '''
+                    # Build the React application
+                    npm run build
+                    
+                    # Verify build output
+                    ls -la build/
+                    
+                    # Check build size
+                    du -sh build/
+                '''
+                
+                // Archive build artifacts
+                archiveArtifacts artifacts: 'build/**/*', fingerprint: true
+            }
+        }
+        
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    echo "Building Docker image: ${DOCKER_REGISTRY}/${DOCKER_REPO}:${IMAGE_TAG}"
+                    
+                    // Build Docker image
+                    def image = docker.build("${DOCKER_REGISTRY}/${DOCKER_REPO}:${IMAGE_TAG}", "-f docker/Dockerfile .")
+                    
+                    // Tag with latest for main branch
+                    if (env.BRANCH_NAME == 'main') {
+                        image.tag('latest')
+                    }
+                    
+                    // Push to registry
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-registry-credentials') {
+                        image.push()
+                        if (env.BRANCH_NAME == 'main') {
+                            image.push('latest')
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Infrastructure Validation') {
+            when {
+                anyOf {
+                    changeset "terraform/**"
+                    branch 'main'
+                }
+            }
+            steps {
+                dir('terraform') {
+                    sh '''
+                        # Initialize Terraform
+                        terraform init
+                        
+                        # Validate Terraform configuration
+                        terraform validate
+                        
+                        # Plan infrastructure changes
+                        terraform plan -var-file="environments/${ENVIRONMENT}.tfvars" -out=tfplan
+                    '''
+                    
+                    // Archive Terraform plan
+                    archiveArtifacts artifacts: 'tfplan', fingerprint: true
+                }
+            }
+        }
+        
+        stage('Deploy to Development') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    echo "Deploying to development environment"
+                    deployToEnvironment('dev')
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo "Deploying to staging environment"
+                    deployToEnvironment('staging')
+                }
+            }
+        }
+        
+        stage('Production Deployment Approval') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    def deployToProduction = input(
+                        message: 'Deploy to Production?',
+                        parameters: [
+                            choice(
+                                choices: ['No', 'Yes'],
+                                description: 'Deploy to production environment?',
+                                name: 'DEPLOY_TO_PROD'
+                            )
+                        ]
+                    )
+                    
+                    if (deployToProduction == 'Yes') {
+                        echo "Production deployment approved"
+                        env.DEPLOY_TO_PROD = 'true'
+                    } else {
+                        echo "Production deployment skipped"
+                        env.DEPLOY_TO_PROD = 'false'
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                allOf {
+                    branch 'main'
+                    environment name: 'DEPLOY_TO_PROD', value: 'true'
+                }
+            }
+            steps {
+                script {
+                    echo "Deploying to production environment"
+                    deployToEnvironment('prod')
+                }
+            }
+        }
+        
+        stage('Post-Deployment Tests') {
+            when {
+                anyOf {
+                    environment name: 'DEPLOY_TO_PROD', value: 'true'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    def targetUrl = getDeploymentUrl(ENVIRONMENT)
+                    echo "Running post-deployment tests against: ${targetUrl}"
+                    
+                    sh """
+                        # Health check
+                        curl -f ${targetUrl}/health || exit 1
+                        
+                        # Basic functionality test
+                        curl -f ${targetUrl}/ || exit 1
+                        
+                        # Performance test (basic)
+                        curl -w "@curl-format.txt" -o /dev/null -s ${targetUrl}/
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up Docker images
+            sh '''
+                docker image prune -f
+                docker system prune -f --volumes
+            '''
+            
+            // Archive logs
+            archiveArtifacts artifacts: 'logs/**/*', allowEmptyArchive: true
+        }
+        
+        success {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    slackSend(
+                        channel: '#deployments',
+                        color: 'good',
+                        message: "✅ Production deployment successful: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+                    )
+                }
+            }
+        }
+        
+        failure {
+            script {
+                slackSend(
+                    channel: '#deployments',
+                    color: 'danger',
+                    message: "❌ Deployment failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+                )
+            }
+        }
+        
+        unstable {
+            script {
+                slackSend(
+                    channel: '#deployments',
+                    color: 'warning',
+                    message: "⚠️ Deployment unstable: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+                )
+            }
+        }
+    }
+}
+
+// Helper function to deploy to specific environment
+def deployToEnvironment(environment) {
+    dir('terraform') {
+        sh """
+            # Apply Terraform changes
+            terraform apply -var-file="environments/${environment}.tfvars" -auto-approve tfplan
+            
+            # Get deployment outputs
+            terraform output -json > outputs.json
+        """
+        
+        // Archive Terraform outputs
+        archiveArtifacts artifacts: 'outputs.json', fingerprint: true
+    }
+    
+    // Deploy application to EC2 instances
+    script {
+        def instances = getEC2Instances(environment)
+        instances.each { instance ->
+            deployToInstance(instance, environment)
+        }
+    }
+}
+
+// Helper function to deploy to specific EC2 instance
+def deployToInstance(instanceIp, environment) {
+    sh """
+        # Deploy to EC2 instance
+        ssh -o StrictHostKeyChecking=no ec2-user@${instanceIp} '
+            # Pull latest Docker image
+            docker pull ${DOCKER_REGISTRY}/${DOCKER_REPO}:${IMAGE_TAG}
+            
+            # Stop existing container
+            docker stop react-app || true
+            docker rm react-app || true
+            
+            # Run new container
+            docker run -d --name react-app -p 80:80 --restart unless-stopped ${DOCKER_REGISTRY}/${DOCKER_REPO}:${IMAGE_TAG}
+            
+            # Verify deployment
+            sleep 10
+            curl -f http://localhost/health
+        '
+    """
+}
+
+// Helper function to get EC2 instances for environment
+def getEC2Instances(environment) {
+    // This would typically query AWS or Terraform state
+    // For now, return placeholder
+    return ['10.0.1.100', '10.0.2.100']
+}
+
+// Helper function to get deployment URL
+def getDeploymentUrl(environment) {
+    switch(environment) {
+        case 'dev':
+            return 'http://dev-react-app.example.com'
+        case 'staging':
+            return 'http://staging-react-app.example.com'
+        case 'prod':
+            return 'http://react-app.example.com'
+        default:
+            return 'http://localhost'
+    }
+}
+
